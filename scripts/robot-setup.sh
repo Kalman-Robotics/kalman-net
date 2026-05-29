@@ -92,17 +92,29 @@ echo "${OVERLAY_IP}" | tee "${KALMAN_DIR}/overlay_ip" > /dev/null
 echo "${KALMAN_NET_SERVER}" | tee "${KALMAN_DIR}/server_url" > /dev/null
 log_ok "Registrado. Peer ID: ${PEER_ID} | IP overlay: ${OVERLAY_IP}"
 
-# ─── 5. Levantar interfaz WireGuard ───
+# ─── 5. Levantar interfaz WireGuard via wg-quick ───
 log_info "Configurando interfaz WireGuard (${WG_IFACE})..."
 
+# Copiar clave a /etc/wireguard/ (ruta permitida por AppArmor en Ubuntu)
+mkdir -p /etc/wireguard
+cp "${KALMAN_DIR}/privatekey" /etc/wireguard/wg0.key
+chmod 600 /etc/wireguard/wg0.key
+
+PRIVATE_KEY=$(cat "${KALMAN_DIR}/privatekey")
+
+# Escribir config base — sin peers aún, el daemon los agrega dinámicamente
+cat > /etc/wireguard/wg0.conf << WGEOF
+[Interface]
+PrivateKey = ${PRIVATE_KEY}
+Address = ${OVERLAY_IP}/24
+ListenPort = ${WG_PORT}
+WGEOF
+chmod 600 /etc/wireguard/wg0.conf
+
 # Derribar interfaz anterior si existe
-ip link del "${WG_IFACE}" 2>/dev/null || true
+wg-quick down "${WG_IFACE}" 2>/dev/null || true
 
-ip link add dev "${WG_IFACE}" type wireguard
-wg set "${WG_IFACE}" private-key "${KALMAN_DIR}/privatekey" listen-port "${WG_PORT}"
-ip addr add "${OVERLAY_IP}/24" dev "${WG_IFACE}"
-ip link set "${WG_IFACE}" up
-
+wg-quick up "${WG_IFACE}"
 log_ok "Interfaz ${WG_IFACE} activa. IP: ${OVERLAY_IP}"
 
 # ─── 6. Instalar kalman-net-sync (daemon de sincronización WireGuard) ───

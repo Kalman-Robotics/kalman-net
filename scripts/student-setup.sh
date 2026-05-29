@@ -114,13 +114,21 @@ echo "${GROUP_ID}"  > "${KALMAN_DIR}/group_id"
 echo "${KALMAN_NET_SERVER}" > "${KALMAN_DIR}/server_url"
 log_ok "Unido al grupo. IP overlay: ${OVERLAY_IP}"
 
-# ─── 6. Levantar interfaz WireGuard ───
+# ─── 6. Levantar interfaz WireGuard via wg-quick ───
 log_info "Levantando interfaz WireGuard..."
-ip link del "${WG_IFACE}" 2>/dev/null || true
-ip link add dev "${WG_IFACE}" type wireguard
-wg set "${WG_IFACE}" private-key "${KALMAN_DIR}/privatekey" listen-port "${WG_PORT}"
-ip addr add "${OVERLAY_IP}/24" dev "${WG_IFACE}"
-ip link set "${WG_IFACE}" up
+
+mkdir -p /etc/wireguard
+PRIVATE_KEY=$(cat "${KALMAN_DIR}/privatekey")
+cat > /etc/wireguard/wg0.conf << WGEOF
+[Interface]
+PrivateKey = ${PRIVATE_KEY}
+Address = ${OVERLAY_IP}/24
+ListenPort = ${WG_PORT}
+WGEOF
+chmod 600 /etc/wireguard/wg0.conf
+
+wg-quick down "${WG_IFACE}" 2>/dev/null || true
+wg-quick up "${WG_IFACE}"
 log_ok "Interfaz ${WG_IFACE} activa. IP: ${OVERLAY_IP}"
 
 # ─── 7. Instalar kalman-net-sync ───
