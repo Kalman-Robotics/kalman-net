@@ -1,0 +1,17 @@
+services:
+  kalman-net:
+    build:
+      context: ../server
+      dockerfile: Dockerfile
+    container_name: kalman-net
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      - PORT=8080
+      - ADMIN_TOKEN=${ADMIN_TOKEN:-kalman-dev-token}
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
