@@ -267,34 +267,9 @@ s.close()
 
 # ─── Actualizar endpoint vía STUN y notificar al servidor ───
 update_stun_endpoint() {
-    NEW_ENDPOINT=$(python3 - <<'PYEOF' 2>/dev/null || echo "")
-import socket, struct, os
-STUN_SERVER = ("stun.l.google.com", 19302)
-pkt = struct.pack(">HHI12s", 0x0001, 0, 0x2112A442, os.urandom(12))
-try:
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-    s.bind(("0.0.0.0", 51820))
-    s.settimeout(5)
-    s.sendto(pkt, STUN_SERVER)
-    data, _ = s.recvfrom(512)
-    s.close()
-    offset = 20
-    while offset < len(data) - 4:
-        t = struct.unpack(">H", data[offset:offset+2])[0]
-        l = struct.unpack(">H", data[offset+2:offset+4])[0]
-        if t == 0x0020 and data[offset+5] == 1:
-            port = struct.unpack(">H", data[offset+6:offset+8])[0] ^ 0x2112
-            ip   = bytes(b ^ v for b, v in zip(data[offset+8:offset+12], struct.pack(">I", 0x2112A442)))
-            print(f"{ip[0]}.{ip[1]}.{ip[2]}.{ip[3]}:{port}")
-            break
-        offset += 4 + l + (4 - l % 4) % 4
-except:
-    pass
-PYEOF
-
+    NEW_ENDPOINT=$(python3 /tmp/kalman_stun.py 2>/dev/null || echo "")
     [ -z "${NEW_ENDPOINT}" ] && return
+    NEW_ENDPOINT="${NEW_ENDPOINT}:51820"
 
     LOCAL_IPS=$(ip -4 addr show scope global | grep -oP '(?<=inet )\d+\.\d+\.\d+\.\d+' | grep -v '^127\.' | jq -R . | jq -s .)
     curl -sf --max-time 5 -X POST \
