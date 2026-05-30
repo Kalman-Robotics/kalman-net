@@ -277,6 +277,19 @@ s.close()
     fi
 }
 
+# ─── Heartbeat en background ───
+heartbeat_loop() {
+    while true; do
+        curl -sf --max-time 5 -X POST \
+            "${SERVER_URL}/api/peers/${PEER_ID}/heartbeat" \
+            -H "Content-Type: application/json" \
+            -d "{}" > /dev/null 2>&1 || true
+        sleep 30
+    done
+}
+heartbeat_loop &
+HEARTBEAT_PID=$!
+
 # ─── Loop principal ───
 if command -v websocat &>/dev/null; then
     WS_URL=$(echo "${SERVER_URL}" | sed 's|http://|ws://|' | sed 's|https://|wss://|')

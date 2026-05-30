@@ -278,6 +278,19 @@ update_stun_endpoint() {
         -d "{\"endpoint\":\"${NEW_ENDPOINT}\",\"local_ips\":${LOCAL_IPS}}" > /dev/null 2>&1 || true
 }
 
+# ─── Heartbeat en background ───
+heartbeat_loop() {
+    while true; do
+        curl -sf --max-time 5 -X POST \
+            "${SERVER_URL}/api/peers/${PEER_ID}/heartbeat" \
+            -H "Content-Type: application/json" \
+            -d "{}" > /dev/null 2>&1 || true
+        sleep 30
+    done
+}
+heartbeat_loop &
+HEARTBEAT_PID=$!
+
 # ─── Loop principal ───
 if command -v websocat &>/dev/null; then
     WS_URL=$(echo "${SERVER_URL}" | sed 's|http://|ws://|' | sed 's|https://|wss://|')
@@ -299,7 +312,6 @@ if command -v websocat &>/dev/null; then
                     logger -t kalman-net-sync "relay pkt recibido (ignorado en robot)"
                     ;;
                 "")
-                    # Formato antiguo — red map directo
                     apply_network_map "${line}"
                     ;;
             esac
