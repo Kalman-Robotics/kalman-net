@@ -18,13 +18,14 @@ import (
 // ─────────────────────────────────────────────
 
 type Peer struct {
-	ID        string    `json:"id"`
-	Hostname  string    `json:"hostname"`
-	PublicKey string    `json:"public_key"`
-	OverlayIP string    `json:"overlay_ip"`
-	Endpoint  string    `json:"endpoint"` // IP:puerto público del peer
-	LastSeen  time.Time `json:"last_seen"`
-	Online    bool      `json:"online"`
+	ID         string    `json:"id"`
+	Hostname   string    `json:"hostname"`
+	PublicKey  string    `json:"public_key"`
+	OverlayIP  string    `json:"overlay_ip"`
+	Endpoint   string    `json:"endpoint"`    // IP:puerto público (vía STUN)
+	LocalIPs   []string  `json:"local_ips"`   // IPs locales LAN
+	LastSeen   time.Time `json:"last_seen"`
+	Online     bool      `json:"online"`
 }
 
 type Group struct {
@@ -39,10 +40,32 @@ type JoinCode struct {
 	ExpiresAt time.Time `json:"expires_at"`
 }
 
-// NetworkMap es lo que recibe cada agente: sus peers en el grupo
+// NetworkMap — lo que recibe cada agente
 type NetworkMap struct {
-	SelfIP string  `json:"self_ip"`
-	Peers  []Peer  `json:"peers"`
+	SelfIP string `json:"self_ip"`
+	Peers  []Peer `json:"peers"`
+}
+
+// WsMessage — mensajes tipados via WebSocket
+type WsMessage struct {
+	Type    string          `json:"type"`
+	Payload json.RawMessage `json:"payload"`
+}
+
+// PunchSignal — señal de hole punch que el servidor envía a un peer
+type PunchSignal struct {
+	PeerID       string   `json:"peer_id"`
+	Endpoint     string   `json:"endpoint"`      // endpoint público del otro peer
+	LocalIPs     []string `json:"local_ips"`     // IPs locales del otro peer
+	WGPublicKey  string   `json:"wg_public_key"` // clave WG del otro peer
+	OverlayIP    string   `json:"overlay_ip"`    // IP overlay del otro peer
+}
+
+// RelayPacket — paquete WireGuard encapsulado para relay via WebSocket
+type RelayPacket struct {
+	FromPeerID string `json:"from"`
+	ToPeerID   string `json:"to"`
+	Data       []byte `json:"data"` // payload WireGuard cifrado (opaco)
 }
 
 // ─────────────────────────────────────────────
@@ -51,11 +74,11 @@ type NetworkMap struct {
 
 type State struct {
 	mu         sync.RWMutex
-	peers      map[string]*Peer      // id → peer
-	groups     map[string]*Group     // id → group
-	joinCodes  map[string]*JoinCode  // code → joincode
-	ipCounter  int                   // próxima IP a asignar (10.99.0.X)
-	wsClients  map[string]*wsClient  // peer_id → wsClient
+	peers      map[string]*Peer
+	groups     map[string]*Group
+	joinCodes  map[string]*JoinCode
+	ipCounter  int
+	wsClients  map[string]*wsClient
 	adminToken string
 }
 
@@ -87,23 +110,6 @@ func (s *State) getPeerByID(id string) (*Peer, bool) {
 	return p, ok
 }
 
-func (s *State) getGroupsForPeer(peerID string) []*Group {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	var groups []*Group
-	for _, g := range s.groups {
-		for _, pid := range g.PeerIDs {
-			if pid == peerID {
-				groups = append(groups, g)
-				break
-			}
-		}
-	}
-	return groups
-}
-
-// networkMapForPeer construye el mapa de red que debe recibir un peer:
-// todos los peers de todos sus grupos (excepto él mismo)
 func (s *State) networkMapForPeer(peerID string) NetworkMap {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -139,7 +145,35 @@ func (s *State) networkMapForPeer(peerID string) NetworkMap {
 	return NetworkMap{SelfIP: self.OverlayIP, Peers: peers}
 }
 
-// pushToGroup notifica a todos los agentes WS en un grupo que el network map cambió
+// sendToClient envía un mensaje tipado a un peer via WebSocket
+func (s *State) sendToClient(peerID string, msgType string, payload interface{}) {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+	msg := WsMessage{Type: msgType, Payload: json.RawMessage(data)}
+	raw, err := json.Marshal(msg)
+	if err != nil {
+		return
+	}
+	s.mu.RLock()
+	client, ok := s.wsClients[peerID]
+	s.mu.RUnlock()
+	if ok {
+		select {
+		case client.send <- raw:
+		default:
+		}
+	}
+}
+
+// pushNetworkMap envía el network map actualizado a un peer
+func (s *State) pushNetworkMap(peerID string) {
+	nm := s.networkMapForPeer(peerID)
+	s.sendToClient(peerID, "network_map", nm)
+}
+
+// pushToGroup notifica a todos los peers del grupo
 func (s *State) pushToGroup(groupID string) {
 	s.mu.RLock()
 	g, ok := s.groups[groupID]
@@ -152,27 +186,65 @@ func (s *State) pushToGroup(groupID string) {
 	s.mu.RUnlock()
 
 	for _, pid := range peerIDs {
-		nm := s.networkMapForPeer(pid)
-		data, _ := json.Marshal(nm)
-		s.mu.RLock()
-		client, ok := s.wsClients[pid]
+		s.pushNetworkMap(pid)
+	}
+}
+
+// triggerPunch coordina el hole punch entre dos peers del mismo grupo
+// Envía a cada uno los endpoints del otro simultáneamente
+func (s *State) triggerPunch(peerA, peerB *Peer) {
+	log.Printf("[punch] coordinando %s ↔ %s", peerA.Hostname, peerB.Hostname)
+
+	signalA := PunchSignal{
+		PeerID:      peerB.ID,
+		Endpoint:    peerB.Endpoint,
+		LocalIPs:    peerB.LocalIPs,
+		WGPublicKey: peerB.PublicKey,
+		OverlayIP:   peerB.OverlayIP,
+	}
+	signalB := PunchSignal{
+		PeerID:      peerA.ID,
+		Endpoint:    peerA.Endpoint,
+		LocalIPs:    peerA.LocalIPs,
+		WGPublicKey: peerA.PublicKey,
+		OverlayIP:   peerA.OverlayIP,
+	}
+
+	// Enviar simultáneamente a ambos
+	go s.sendToClient(peerA.ID, "punch", signalA)
+	go s.sendToClient(peerB.ID, "punch", signalB)
+}
+
+// triggerPunchForGroup lanza hole punch entre todos los pares del grupo
+func (s *State) triggerPunchForGroup(groupID string) {
+	s.mu.RLock()
+	g, ok := s.groups[groupID]
+	if !ok {
 		s.mu.RUnlock()
-		if ok {
-			select {
-			case client.send <- data:
-			default:
+		return
+	}
+	peerIDs := make([]string, len(g.PeerIDs))
+	copy(peerIDs, g.PeerIDs)
+	s.mu.RUnlock()
+
+	// Combinar todos los pares posibles
+	for i := 0; i < len(peerIDs); i++ {
+		for j := i + 1; j < len(peerIDs); j++ {
+			s.mu.RLock()
+			pA, okA := s.peers[peerIDs[i]]
+			pB, okB := s.peers[peerIDs[j]]
+			s.mu.RUnlock()
+			if okA && okB && pA.Online && pB.Online {
+				s.triggerPunch(pA, pB)
 			}
 		}
 	}
 }
 
-// authAdmin valida el token de administrador
 func authAdmin(r *http.Request) bool {
-	token := r.Header.Get("X-Admin-Token")
-	return token == state.adminToken
+	return r.Header.Get("X-Admin-Token") == state.adminToken
 }
 
-// respond escribe JSON con status code
 func respond(w http.ResponseWriter, code int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
@@ -184,13 +256,12 @@ func respond(w http.ResponseWriter, code int, v interface{}) {
 // ─────────────────────────────────────────────
 
 // POST /api/peers/register
-// Body: { hostname, public_key, endpoint }
-// Responde: peer completo con overlay_ip asignada
 func handleRegisterPeer(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Hostname  string `json:"hostname"`
-		PublicKey string `json:"public_key"`
-		Endpoint  string `json:"endpoint"`
+		Hostname  string   `json:"hostname"`
+		PublicKey string   `json:"public_key"`
+		Endpoint  string   `json:"endpoint"`
+		LocalIPs  []string `json:"local_ips"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.PublicKey == "" || req.Hostname == "" {
 		respond(w, 400, map[string]string{"error": "hostname y public_key requeridos"})
@@ -198,21 +269,19 @@ func handleRegisterPeer(w http.ResponseWriter, r *http.Request) {
 	}
 
 	state.mu.Lock()
-	// Buscar si ya existe por hostname (re-registro)
-	var existing *Peer
+	var peer *Peer
 	for _, p := range state.peers {
 		if p.Hostname == req.Hostname {
-			existing = p
+			peer = p
 			break
 		}
 	}
-	var peer *Peer
-	if existing != nil {
-		existing.PublicKey = req.PublicKey
-		existing.Endpoint = req.Endpoint
-		existing.LastSeen = time.Now()
-		existing.Online = true
-		peer = existing
+	if peer != nil {
+		peer.PublicKey = req.PublicKey
+		peer.Endpoint = req.Endpoint
+		peer.LocalIPs = req.LocalIPs
+		peer.LastSeen = time.Now()
+		peer.Online = true
 	} else {
 		peer = &Peer{
 			ID:        uuid.NewString(),
@@ -220,6 +289,7 @@ func handleRegisterPeer(w http.ResponseWriter, r *http.Request) {
 			PublicKey: req.PublicKey,
 			OverlayIP: state.allocateIP(),
 			Endpoint:  req.Endpoint,
+			LocalIPs:  req.LocalIPs,
 			LastSeen:  time.Now(),
 			Online:    true,
 		}
@@ -247,11 +317,11 @@ func handleListPeers(w http.ResponseWriter, r *http.Request) {
 }
 
 // POST /api/peers/:id/heartbeat
-// Body: { endpoint }
 func handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	peerID := r.PathValue("id")
 	var req struct {
-		Endpoint string `json:"endpoint"`
+		Endpoint string   `json:"endpoint"`
+		LocalIPs []string `json:"local_ips"`
 	}
 	json.NewDecoder(r.Body).Decode(&req)
 
@@ -267,17 +337,29 @@ func handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	if req.Endpoint != "" {
 		p.Endpoint = req.Endpoint
 	}
+	if len(req.LocalIPs) > 0 {
+		p.LocalIPs = req.LocalIPs
+	}
 	state.mu.Unlock()
 
 	respond(w, 200, map[string]string{"ok": "1"})
+}
+
+// GET /api/peers/:id/network-map — fallback polling para agentes sin WebSocket activo
+func handleNetworkMap(w http.ResponseWriter, r *http.Request) {
+	peerID := r.PathValue("id")
+	if _, ok := state.getPeerByID(peerID); !ok {
+		respond(w, 404, map[string]string{"error": "peer not found"})
+		return
+	}
+	nm := state.networkMapForPeer(peerID)
+	respond(w, 200, nm)
 }
 
 // ─────────────────────────────────────────────
 // Handlers — Grupos
 // ─────────────────────────────────────────────
 
-// POST /api/groups
-// Body: { name }
 func handleCreateGroup(w http.ResponseWriter, r *http.Request) {
 	if !authAdmin(r) {
 		respond(w, 401, map[string]string{"error": "unauthorized"})
@@ -290,20 +372,14 @@ func handleCreateGroup(w http.ResponseWriter, r *http.Request) {
 		respond(w, 400, map[string]string{"error": "name requerido"})
 		return
 	}
-	g := &Group{
-		ID:      uuid.NewString(),
-		Name:    req.Name,
-		PeerIDs: []string{},
-	}
+	g := &Group{ID: uuid.NewString(), Name: req.Name, PeerIDs: []string{}}
 	state.mu.Lock()
 	state.groups[g.ID] = g
 	state.mu.Unlock()
-
 	log.Printf("[group] creado id=%s name=%s", g.ID, g.Name)
 	respond(w, 200, g)
 }
 
-// GET /api/groups
 func handleListGroups(w http.ResponseWriter, r *http.Request) {
 	if !authAdmin(r) {
 		respond(w, 401, map[string]string{"error": "unauthorized"})
@@ -318,7 +394,6 @@ func handleListGroups(w http.ResponseWriter, r *http.Request) {
 	respond(w, 200, groups)
 }
 
-// GET /api/groups/:id
 func handleGetGroup(w http.ResponseWriter, r *http.Request) {
 	if !authAdmin(r) {
 		respond(w, 401, map[string]string{"error": "unauthorized"})
@@ -335,8 +410,6 @@ func handleGetGroup(w http.ResponseWriter, r *http.Request) {
 	respond(w, 200, g)
 }
 
-// POST /api/groups/:id/members
-// Body: { peer_id }
 func handleAddMember(w http.ResponseWriter, r *http.Request) {
 	if !authAdmin(r) {
 		respond(w, 401, map[string]string{"error": "unauthorized"})
@@ -363,7 +436,6 @@ func handleAddMember(w http.ResponseWriter, r *http.Request) {
 		respond(w, 404, map[string]string{"error": "peer not found"})
 		return
 	}
-	// Evitar duplicados
 	for _, pid := range g.PeerIDs {
 		if pid == req.PeerID {
 			state.mu.Unlock()
@@ -376,10 +448,10 @@ func handleAddMember(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[group] peer=%s agregado a group=%s", req.PeerID, gid)
 	go state.pushToGroup(gid)
+	go state.triggerPunchForGroup(gid)
 	respond(w, 200, g)
 }
 
-// DELETE /api/groups/:id/members/:peer_id
 func handleRemoveMember(w http.ResponseWriter, r *http.Request) {
 	if !authAdmin(r) {
 		respond(w, 401, map[string]string{"error": "unauthorized"})
@@ -404,12 +476,10 @@ func handleRemoveMember(w http.ResponseWriter, r *http.Request) {
 	g.PeerIDs = newList
 	state.mu.Unlock()
 
-	log.Printf("[group] peer=%s eliminado de group=%s", pid, gid)
 	go state.pushToGroup(gid)
 	respond(w, 200, g)
 }
 
-// DELETE /api/groups/:id
 func handleDeleteGroup(w http.ResponseWriter, r *http.Request) {
 	if !authAdmin(r) {
 		respond(w, 401, map[string]string{"error": "unauthorized"})
@@ -429,19 +499,9 @@ func handleDeleteGroup(w http.ResponseWriter, r *http.Request) {
 	delete(state.groups, gid)
 	state.mu.Unlock()
 
-	// Notificar a todos los peers que el grupo fue disuelto (network map vacío)
+	// Notificar network map vacío a todos los peers
 	for _, pid := range peerIDs {
-		nm := NetworkMap{Peers: []Peer{}}
-		data, _ := json.Marshal(nm)
-		state.mu.RLock()
-		client, ok := state.wsClients[pid]
-		state.mu.RUnlock()
-		if ok {
-			select {
-			case client.send <- data:
-			default:
-			}
-		}
+		state.sendToClient(pid, "network_map", NetworkMap{Peers: []Peer{}})
 	}
 	respond(w, 200, map[string]string{"ok": "1"})
 }
@@ -450,8 +510,6 @@ func handleDeleteGroup(w http.ResponseWriter, r *http.Request) {
 // Handlers — Join Codes
 // ─────────────────────────────────────────────
 
-// POST /api/groups/:id/join-code
-// Genera un join code temporal para que un agente se una al grupo
 func handleCreateJoinCode(w http.ResponseWriter, r *http.Request) {
 	if !authAdmin(r) {
 		respond(w, 401, map[string]string{"error": "unauthorized"})
@@ -475,19 +533,17 @@ func handleCreateJoinCode(w http.ResponseWriter, r *http.Request) {
 	state.joinCodes[jc.Code] = jc
 	state.mu.Unlock()
 
-	log.Printf("[joincode] creado code=%s group=%s expires=%s", jc.Code, gid, jc.ExpiresAt.Format(time.RFC3339))
+	log.Printf("[joincode] creado code=%s group=%s", jc.Code, gid)
 	respond(w, 200, jc)
 }
 
-// POST /api/join
-// Body: { join_code, hostname, public_key, endpoint }
-// El agente usa esto para registrarse y unirse al grupo de la sesión
 func handleJoin(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		JoinCode  string `json:"join_code"`
-		Hostname  string `json:"hostname"`
-		PublicKey string `json:"public_key"`
-		Endpoint  string `json:"endpoint"`
+		JoinCode  string   `json:"join_code"`
+		Hostname  string   `json:"hostname"`
+		PublicKey string   `json:"public_key"`
+		Endpoint  string   `json:"endpoint"`
+		LocalIPs  []string `json:"local_ips"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		respond(w, 400, map[string]string{"error": "json inválido"})
@@ -506,10 +562,8 @@ func handleJoin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	groupID := jc.GroupID
-	// El join code es de un solo uso
 	delete(state.joinCodes, req.JoinCode)
 
-	// Registrar o actualizar peer
 	var peer *Peer
 	for _, p := range state.peers {
 		if p.Hostname == req.Hostname {
@@ -524,6 +578,7 @@ func handleJoin(w http.ResponseWriter, r *http.Request) {
 			PublicKey: req.PublicKey,
 			OverlayIP: state.allocateIP(),
 			Endpoint:  req.Endpoint,
+			LocalIPs:  req.LocalIPs,
 			LastSeen:  time.Now(),
 			Online:    true,
 		}
@@ -531,11 +586,11 @@ func handleJoin(w http.ResponseWriter, r *http.Request) {
 	} else {
 		peer.PublicKey = req.PublicKey
 		peer.Endpoint = req.Endpoint
+		peer.LocalIPs = req.LocalIPs
 		peer.LastSeen = time.Now()
 		peer.Online = true
 	}
 
-	// Agregar al grupo
 	g := state.groups[groupID]
 	alreadyIn := false
 	for _, pid := range g.PeerIDs {
@@ -551,6 +606,7 @@ func handleJoin(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[join] peer=%s ip=%s group=%s", peer.Hostname, peer.OverlayIP, groupID)
 	go state.pushToGroup(groupID)
+	go state.triggerPunchForGroup(groupID)
 
 	respond(w, 200, map[string]interface{}{
 		"peer":     peer,
@@ -559,11 +615,49 @@ func handleJoin(w http.ResponseWriter, r *http.Request) {
 }
 
 // ─────────────────────────────────────────────
-// Handler — WebSocket (actualizaciones en tiempo real)
+// Handler — Relay de paquetes WireGuard
+// POST /api/relay
+// El agente usa esto cuando P2P falla: encapsula paquetes WireGuard en HTTP
 // ─────────────────────────────────────────────
 
-// GET /ws?peer_id=XXX
-// El agente abre esta conexión y recibe pushes cuando su network map cambia
+func handleRelay(w http.ResponseWriter, r *http.Request) {
+	var pkt RelayPacket
+	if err := json.NewDecoder(r.Body).Decode(&pkt); err != nil || pkt.ToPeerID == "" {
+		respond(w, 400, map[string]string{"error": "invalid relay packet"})
+		return
+	}
+
+	// Reenviar via WebSocket al peer destino
+	state.mu.RLock()
+	client, ok := state.wsClients[pkt.ToPeerID]
+	state.mu.RUnlock()
+
+	if !ok {
+		respond(w, 404, map[string]string{"error": "peer destino no conectado"})
+		return
+	}
+
+	raw, _ := json.Marshal(WsMessage{
+		Type:    "relay",
+		Payload: mustMarshal(pkt),
+	})
+	select {
+	case client.send <- raw:
+		respond(w, 200, map[string]string{"ok": "1"})
+	default:
+		respond(w, 503, map[string]string{"error": "peer buffer lleno"})
+	}
+}
+
+func mustMarshal(v interface{}) json.RawMessage {
+	b, _ := json.Marshal(v)
+	return b
+}
+
+// ─────────────────────────────────────────────
+// Handler — WebSocket
+// ─────────────────────────────────────────────
+
 func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	peerID := r.URL.Query().Get("peer_id")
 	if peerID == "" {
@@ -584,21 +678,14 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	client := &wsClient{
-		conn:   conn,
-		peerID: peerID,
-		send:   make(chan []byte, 8),
-	}
+	client := &wsClient{conn: conn, peerID: peerID, send: make(chan []byte, 16)}
 	state.mu.Lock()
 	state.wsClients[peerID] = client
 	state.mu.Unlock()
-
 	log.Printf("[ws] peer=%s conectado", peerID)
 
-	// Enviar network map inmediatamente al conectar
-	nm := state.networkMapForPeer(peerID)
-	data, _ := json.Marshal(nm)
-	client.send <- data
+	// Enviar network map inmediatamente
+	go state.pushNetworkMap(peerID)
 
 	// Goroutine de escritura
 	go func() {
@@ -610,11 +697,45 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	// Loop de lectura (mantiene la conexión, detecta desconexión)
+	// Loop de lectura — procesar mensajes entrantes del agente
 	for {
-		_, _, err := conn.ReadMessage()
+		_, raw, err := conn.ReadMessage()
 		if err != nil {
 			break
+		}
+		var msg WsMessage
+		if err := json.Unmarshal(raw, &msg); err != nil {
+			continue
+		}
+		switch msg.Type {
+		case "punch_ok":
+			// El peer confirmó que el hole punch fue exitoso
+			var payload struct {
+				PeerID string `json:"peer_id"`
+			}
+			if err := json.Unmarshal(msg.Payload, &payload); err == nil {
+				log.Printf("[punch] %s confirmó P2P con %s", peerID, payload.PeerID)
+			}
+		case "endpoint_update":
+			// El peer actualizó su endpoint público (después de STUN)
+			var payload struct {
+				Endpoint string   `json:"endpoint"`
+				LocalIPs []string `json:"local_ips"`
+			}
+			if err := json.Unmarshal(msg.Payload, &payload); err == nil {
+				state.mu.Lock()
+				if p, ok := state.peers[peerID]; ok {
+					p.Endpoint = payload.Endpoint
+					p.LocalIPs = payload.LocalIPs
+				}
+				state.mu.Unlock()
+				log.Printf("[endpoint] peer=%s nuevo endpoint=%s", peerID, payload.Endpoint)
+				// Re-triggerear punch con peers del grupo
+				groups := state.getGroupsForPeer(peerID)
+				for _, g := range groups {
+					go state.triggerPunchForGroup(g.ID)
+				}
+			}
 		}
 	}
 
@@ -628,8 +749,23 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[ws] peer=%s desconectado", peerID)
 }
 
+func (s *State) getGroupsForPeer(peerID string) []*Group {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var groups []*Group
+	for _, g := range s.groups {
+		for _, pid := range g.PeerIDs {
+			if pid == peerID {
+				groups = append(groups, g)
+				break
+			}
+		}
+	}
+	return groups
+}
+
 // ─────────────────────────────────────────────
-// Background: marcar peers offline por timeout
+// Background: marcar peers offline
 // ─────────────────────────────────────────────
 
 func startOfflineChecker() {
@@ -663,7 +799,7 @@ func main() {
 		groups:     map[string]*Group{},
 		joinCodes:  map[string]*JoinCode{},
 		wsClients:  map[string]*wsClient{},
-		ipCounter:  1, // empieza en 10.99.0.2 (10.99.0.1 es el servidor)
+		ipCounter:  1,
 		adminToken: adminToken,
 	}
 
@@ -675,6 +811,7 @@ func main() {
 	mux.HandleFunc("POST /api/peers/register", handleRegisterPeer)
 	mux.HandleFunc("GET /api/peers", handleListPeers)
 	mux.HandleFunc("POST /api/peers/{id}/heartbeat", handleHeartbeat)
+	mux.HandleFunc("GET /api/peers/{id}/network-map", handleNetworkMap)
 
 	// Grupos
 	mux.HandleFunc("POST /api/groups", handleCreateGroup)
@@ -688,21 +825,11 @@ func main() {
 	mux.HandleFunc("POST /api/groups/{id}/join-code", handleCreateJoinCode)
 	mux.HandleFunc("POST /api/join", handleJoin)
 
-	// Network map (fallback polling para agentes sin websocat)
-	mux.HandleFunc("GET /api/peers/{id}/network-map", func(w http.ResponseWriter, r *http.Request) {
-		peerID := r.PathValue("id")
-		if _, ok := state.getPeerByID(peerID); !ok {
-			respond(w, 404, map[string]string{"error": "peer not found"})
-			return
-		}
-		nm := state.networkMapForPeer(peerID)
-		respond(w, 200, nm)
-	})
-
-	// WebSocket
+	// Relay y WebSocket
+	mux.HandleFunc("POST /api/relay", handleRelay)
 	mux.HandleFunc("GET /ws", handleWebSocket)
 
-	// Health check
+	// Health
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		respond(w, 200, map[string]string{"status": "ok"})
 	})

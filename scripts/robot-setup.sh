@@ -19,7 +19,6 @@ ROS_DISTRO="${ROS_DISTRO:-humble}"
 KALMAN_DIR="/var/lib/kalman-net"
 WG_IFACE="wg0"
 WG_PORT="51820"
-OVERLAY_SUBNET="10.99.0.0/24"
 
 # ─── Colors ───
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
@@ -36,16 +35,21 @@ echo -e "${BLUE}  Hostname: ${ROBOT_HOSTNAME}${NC}"
 echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo
 
-# ─── 1. Instalar WireGuard ───
-log_info "Verificando WireGuard..."
-if ! command -v wg &>/dev/null; then
-    log_info "Instalando WireGuard..."
+# ─── 1. Instalar dependencias ───
+log_info "Verificando dependencias..."
+PKGS_NEEDED=""
+command -v wg     &>/dev/null || PKGS_NEEDED="${PKGS_NEEDED} wireguard-tools"
+command -v curl   &>/dev/null || PKGS_NEEDED="${PKGS_NEEDED} curl"
+command -v jq     &>/dev/null || PKGS_NEEDED="${PKGS_NEEDED} jq"
+command -v nmap   &>/dev/null || PKGS_NEEDED="${PKGS_NEEDED} nmap"   # para ncat STUN
+python3 -c "import socket" 2>/dev/null || PKGS_NEEDED="${PKGS_NEEDED} python3"
+
+if [ -n "${PKGS_NEEDED}" ]; then
+    log_info "Instalando:${PKGS_NEEDED}..."
     apt-get update -qq
-    apt-get install -y --no-install-recommends wireguard-tools iproute2 curl jq
-    log_ok "WireGuard instalado."
-else
-    log_ok "WireGuard ya instalado."
+    apt-get install -y --no-install-recommends iproute2 ${PKGS_NEEDED}
 fi
+log_ok "Dependencias listas."
 
 # ─── 2. Generar o cargar keypair WireGuard ───
 mkdir -p "${KALMAN_DIR}"
@@ -63,18 +67,86 @@ fi
 PRIVATE_KEY=$(cat "${KALMAN_DIR}/privatekey")
 PUBLIC_KEY=$(cat "${KALMAN_DIR}/publickey")
 
-# ─── 3. Detectar endpoint público (IP:puerto) ───
-log_info "Detectando IP pública..."
-PUBLIC_IP=$(curl -s --max-time 5 https://api.ipify.org || echo "")
-ENDPOINT="${PUBLIC_IP}:${WG_PORT}"
-log_ok "Endpoint: ${ENDPOINT}"
+# ─── 3. Detectar IPs locales ───
+log_info "Detectando IPs locales..."
+LOCAL_IPS=$(ip -4 addr show scope global | grep -oP '(?<=inet )\d+\.\d+\.\d+\.\d+' | grep -v '^127\.' | tr '\n' ',' | sed 's/,$//')
+LOCAL_IPS_JSON=$(echo "${LOCAL_IPS}" | tr ',' '\n' | grep -v '^$' | jq -R . | jq -s .)
+log_ok "IPs locales: ${LOCAL_IPS}"
 
-# ─── 4. Registrar en el servidor de control ───
+# ─── 4. Levantar interfaz WireGuard (necesaria para STUN desde ese puerto) ───
+log_info "Configurando interfaz WireGuard (${WG_IFACE})..."
+mkdir -p /etc/wireguard
+
+cat > /etc/wireguard/wg0.conf << WGEOF
+[Interface]
+PrivateKey = ${PRIVATE_KEY}
+Address = 10.99.0.1/24
+ListenPort = ${WG_PORT}
+WGEOF
+chmod 600 /etc/wireguard/wg0.conf
+
+wg-quick down "${WG_IFACE}" 2>/dev/null || true
+wg-quick up "${WG_IFACE}"
+log_ok "Interfaz ${WG_IFACE} activa (provisional)."
+
+# ─── 5. STUN desde el puerto WireGuard para obtener endpoint público real ───
+log_info "Detectando endpoint público via STUN desde puerto ${WG_PORT}..."
+# Usamos python3 para hacer STUN binding desde el puerto WG
+PUBLIC_ENDPOINT=$(python3 - <<'PYEOF' 2>/dev/null || echo ""
+import socket, struct, os
+
+# STUN binding request (RFC 5389)
+STUN_SERVER = ("stun.l.google.com", 19302)
+MSG_TYPE = 0x0001
+MSG_LEN  = 0
+MAGIC    = 0x2112A442
+TX_ID    = os.urandom(12)
+
+pkt = struct.pack(">HHI12s", MSG_TYPE, MSG_LEN, MAGIC, TX_ID)
+
+try:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    s.bind(("0.0.0.0", 51820))
+    s.settimeout(5)
+    s.sendto(pkt, STUN_SERVER)
+    data, _ = s.recvfrom(512)
+    s.close()
+
+    # Parsear respuesta — buscar atributo XOR-MAPPED-ADDRESS (0x0020)
+    offset = 20
+    while offset < len(data) - 4:
+        attr_type  = struct.unpack(">H", data[offset:offset+2])[0]
+        attr_len   = struct.unpack(">H", data[offset+2:offset+4])[0]
+        if attr_type == 0x0020:  # XOR-MAPPED-ADDRESS
+            family = data[offset+5]
+            if family == 0x01:  # IPv4
+                port = struct.unpack(">H", data[offset+6:offset+8])[0] ^ 0x2112
+                ip   = bytes(b ^ v for b, v in zip(data[offset+8:offset+12], struct.pack(">I", 0x2112A442)))
+                print(f"{ip[0]}.{ip[1]}.{ip[2]}.{ip[3]}:{port}")
+                break
+        offset += 4 + attr_len + (4 - attr_len % 4) % 4
+except Exception as e:
+    pass
+PYEOF
+)
+
+if [ -z "${PUBLIC_ENDPOINT}" ]; then
+    # Fallback: ip pública + puerto fijo
+    PUBLIC_IP=$(curl -s --max-time 5 https://api.ipify.org || echo "")
+    PUBLIC_ENDPOINT="${PUBLIC_IP}:${WG_PORT}"
+    log_warn "STUN falló, usando fallback: ${PUBLIC_ENDPOINT}"
+else
+    log_ok "Endpoint STUN: ${PUBLIC_ENDPOINT}"
+fi
+
+# ─── 6. Registrar en el servidor de control ───
 log_info "Registrando en el servidor de control..."
 REGISTER_RESPONSE=$(curl -sf --max-time 15 \
     -X POST "${KALMAN_NET_SERVER}/api/peers/register" \
     -H "Content-Type: application/json" \
-    -d "{\"hostname\":\"${ROBOT_HOSTNAME}\",\"public_key\":\"${PUBLIC_KEY}\",\"endpoint\":\"${ENDPOINT}\"}")
+    -d "{\"hostname\":\"${ROBOT_HOSTNAME}\",\"public_key\":\"${PUBLIC_KEY}\",\"endpoint\":\"${PUBLIC_ENDPOINT}\",\"local_ips\":${LOCAL_IPS_JSON}}")
 
 if [ -z "${REGISTER_RESPONSE}" ]; then
     log_err "No se pudo conectar con el servidor de control en ${KALMAN_NET_SERVER}"
@@ -87,22 +159,12 @@ if [ -z "${PEER_ID}" ] || [ "${PEER_ID}" = "null" ]; then
     log_err "Respuesta inválida del servidor: ${REGISTER_RESPONSE}"
 fi
 
-echo "${PEER_ID}"   | tee "${KALMAN_DIR}/peer_id"   > /dev/null
-echo "${OVERLAY_IP}" | tee "${KALMAN_DIR}/overlay_ip" > /dev/null
-echo "${KALMAN_NET_SERVER}" | tee "${KALMAN_DIR}/server_url" > /dev/null
+echo "${PEER_ID}"           > "${KALMAN_DIR}/peer_id"
+echo "${OVERLAY_IP}"        > "${KALMAN_DIR}/overlay_ip"
+echo "${KALMAN_NET_SERVER}" > "${KALMAN_DIR}/server_url"
 log_ok "Registrado. Peer ID: ${PEER_ID} | IP overlay: ${OVERLAY_IP}"
 
-# ─── 5. Levantar interfaz WireGuard via wg-quick ───
-log_info "Configurando interfaz WireGuard (${WG_IFACE})..."
-
-# Copiar clave a /etc/wireguard/ (ruta permitida por AppArmor en Ubuntu)
-mkdir -p /etc/wireguard
-cp "${KALMAN_DIR}/privatekey" /etc/wireguard/wg0.key
-chmod 600 /etc/wireguard/wg0.key
-
-PRIVATE_KEY=$(cat "${KALMAN_DIR}/privatekey")
-
-# Escribir config base — sin peers aún, el daemon los agrega dinámicamente
+# ─── 7. Actualizar configuración WireGuard con IP overlay correcta ───
 cat > /etc/wireguard/wg0.conf << WGEOF
 [Interface]
 PrivateKey = ${PRIVATE_KEY}
@@ -111,43 +173,38 @@ ListenPort = ${WG_PORT}
 WGEOF
 chmod 600 /etc/wireguard/wg0.conf
 
-# Derribar interfaz anterior si existe
 wg-quick down "${WG_IFACE}" 2>/dev/null || true
-
 wg-quick up "${WG_IFACE}"
 log_ok "Interfaz ${WG_IFACE} activa. IP: ${OVERLAY_IP}"
 
-# ─── 6. Instalar kalman-net-sync (daemon de sincronización WireGuard) ───
+# ─── 8. Instalar kalman-net-sync (daemon de sincronización WireGuard) ───
 log_info "Instalando daemon de sincronización..."
 
 cat > /usr/local/bin/kalman-net-sync.sh << 'SYNCEOF'
 #!/bin/bash
-# Daemon que mantiene WireGuard sincronizado con el servidor de control
-# Usa WebSocket para recibir actualizaciones en tiempo real; polling como fallback
+# kalman-net-sync: mantiene WireGuard sincronizado y ejecuta hole punching P2P
 
 KALMAN_DIR="/var/lib/kalman-net"
 WG_IFACE="wg0"
+WG_PORT="51820"
 
 PEER_ID=$(cat "${KALMAN_DIR}/peer_id" 2>/dev/null || echo "")
 SERVER_URL=$(cat "${KALMAN_DIR}/server_url" 2>/dev/null || echo "")
-PRIVATE_KEY_FILE="${KALMAN_DIR}/privatekey"
 
 [ -z "${PEER_ID}" ] || [ -z "${SERVER_URL}" ] && { echo "kalman-net-sync: sin peer_id o server_url"; exit 1; }
 
+# ─── Aplicar network map ───
 apply_network_map() {
     local MAP_JSON="$1"
     [ -z "${MAP_JSON}" ] && return
 
-    SELF_IP=$(echo "${MAP_JSON}" | jq -r '.self_ip // empty')
     PEERS_JSON=$(echo "${MAP_JSON}" | jq -c '.peers // []')
     PEER_COUNT=$(echo "${PEERS_JSON}" | jq 'length')
 
-    # Limpiar peers actuales de WireGuard
     for existing_key in $(wg show "${WG_IFACE}" peers 2>/dev/null); do
         wg set "${WG_IFACE}" peer "${existing_key}" remove
     done
 
-    # Aplicar nuevos peers
     i=0
     while [ $i -lt "${PEER_COUNT}" ]; do
         PUBKEY=$(echo "${PEERS_JSON}"   | jq -r ".[${i}].public_key")
@@ -156,7 +213,8 @@ apply_network_map() {
         HOSTNAME=$(echo "${PEERS_JSON}" | jq -r ".[${i}].hostname")
 
         if [ -n "${PUBKEY}" ] && [ "${PUBKEY}" != "null" ]; then
-            if [ -n "${ENDPOINT}" ] && [ "${ENDPOINT}" != "null" ] && [ "${ENDPOINT}" != ":51820" ]; then
+            if [ -n "${ENDPOINT}" ] && [ "${ENDPOINT}" != "null" ] && \
+               [ "${ENDPOINT}" != ":51820" ] && [ "${ENDPOINT}" != ":51821" ]; then
                 wg set "${WG_IFACE}" peer "${PUBKEY}" \
                     allowed-ips "${PEER_IP}/32" \
                     endpoint "${ENDPOINT}" \
@@ -166,16 +224,114 @@ apply_network_map() {
                     allowed-ips "${PEER_IP}/32" \
                     persistent-keepalive 25
             fi
-            logger -t kalman-net-sync "peer aplicado: ${HOSTNAME} (${PEER_IP})"
+            logger -t kalman-net-sync "peer aplicado: ${HOSTNAME} (${PEER_IP}) endpoint=${ENDPOINT}"
         fi
         i=$((i + 1))
     done
-
     logger -t kalman-net-sync "network map aplicado: ${PEER_COUNT} peers"
 }
 
-# Intentar WebSocket primero (requiere websocat si está disponible)
-# Si no está, usar polling HTTP
+# ─── Ejecutar hole punch UDP ───
+# El servidor envía las candidatas del otro peer; enviamos paquetes UDP vacíos
+# a cada endpoint candidato para abrir el puerto en nuestro NAT simultáneamente
+do_punch() {
+    local SIGNAL_JSON="$1"
+    local TARGET_PUBKEY=$(echo "${SIGNAL_JSON}" | jq -r '.wg_public_key')
+    local TARGET_IP=$(echo "${SIGNAL_JSON}"     | jq -r '.overlay_ip')
+    local TARGET_ENDPOINT=$(echo "${SIGNAL_JSON}" | jq -r '.endpoint // empty')
+    local TARGET_LOCAL_IPS=$(echo "${SIGNAL_JSON}" | jq -r '.local_ips[]? // empty')
+
+    logger -t kalman-net-sync "[punch] iniciando hacia ${TARGET_ENDPOINT}"
+
+    # Agregar peer con endpoint público para que WireGuard intente alcanzarlo
+    if [ -n "${TARGET_PUBKEY}" ] && [ "${TARGET_PUBKEY}" != "null" ]; then
+        if [ -n "${TARGET_ENDPOINT}" ] && [ "${TARGET_ENDPOINT}" != "null" ]; then
+            wg set "${WG_IFACE}" peer "${TARGET_PUBKEY}" \
+                allowed-ips "${TARGET_IP}/32" \
+                endpoint "${TARGET_ENDPOINT}" \
+                persistent-keepalive 5
+        fi
+
+        # Enviar paquetes UDP al endpoint público para abrir NAT
+        if command -v python3 &>/dev/null && [ -n "${TARGET_ENDPOINT}" ]; then
+            TARGET_HOST=$(echo "${TARGET_ENDPOINT}" | cut -d: -f1)
+            TARGET_PORT=$(echo "${TARGET_ENDPOINT}" | cut -d: -f2)
+            python3 -c "
+import socket, time
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+s.bind(('0.0.0.0', ${WG_PORT}))
+for _ in range(5):
+    try:
+        s.sendto(b'\\x00', ('${TARGET_HOST}', ${TARGET_PORT}))
+    except:
+        pass
+    time.sleep(0.1)
+s.close()
+" 2>/dev/null || true
+        fi
+
+        # También probar IPs locales si están en la misma red
+        for LOCAL_IP in ${TARGET_LOCAL_IPS}; do
+            NETWORK=$(echo "${LOCAL_IP}" | cut -d. -f1-3)
+            MY_NETWORK=$(ip -4 addr show "${WG_IFACE}" 2>/dev/null | grep -oP '(?<=inet )\d+\.\d+\.\d+' | head -1 || echo "")
+            # Solo si parecen estar en la misma subred privada
+            case "${LOCAL_IP}" in
+                192.168.*|10.*|172.1[6-9].*|172.2[0-9].*|172.3[0-1].*)
+                    logger -t kalman-net-sync "[punch] probando LAN: ${LOCAL_IP}:${WG_PORT}"
+                    wg set "${WG_IFACE}" peer "${TARGET_PUBKEY}" \
+                        endpoint "${LOCAL_IP}:${WG_PORT}" 2>/dev/null || true
+                    ;;
+            esac
+        done
+
+        # Restaurar keepalive normal después del punch
+        sleep 2
+        wg set "${WG_IFACE}" peer "${TARGET_PUBKEY}" persistent-keepalive 25 2>/dev/null || true
+
+        logger -t kalman-net-sync "[punch] completado hacia ${TARGET_ENDPOINT}"
+    fi
+}
+
+# ─── Actualizar endpoint vía STUN y notificar al servidor ───
+update_stun_endpoint() {
+    NEW_ENDPOINT=$(python3 - <<'PYEOF' 2>/dev/null || echo "")
+import socket, struct, os
+STUN_SERVER = ("stun.l.google.com", 19302)
+pkt = struct.pack(">HHI12s", 0x0001, 0, 0x2112A442, os.urandom(12))
+try:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    s.bind(("0.0.0.0", 51820))
+    s.settimeout(5)
+    s.sendto(pkt, STUN_SERVER)
+    data, _ = s.recvfrom(512)
+    s.close()
+    offset = 20
+    while offset < len(data) - 4:
+        t = struct.unpack(">H", data[offset:offset+2])[0]
+        l = struct.unpack(">H", data[offset+2:offset+4])[0]
+        if t == 0x0020 and data[offset+5] == 1:
+            port = struct.unpack(">H", data[offset+6:offset+8])[0] ^ 0x2112
+            ip   = bytes(b ^ v for b, v in zip(data[offset+8:offset+12], struct.pack(">I", 0x2112A442)))
+            print(f"{ip[0]}.{ip[1]}.{ip[2]}.{ip[3]}:{port}")
+            break
+        offset += 4 + l + (4 - l % 4) % 4
+except:
+    pass
+PYEOF
+
+    [ -z "${NEW_ENDPOINT}" ] && return
+
+    LOCAL_IPS=$(ip -4 addr show scope global | grep -oP '(?<=inet )\d+\.\d+\.\d+\.\d+' | grep -v '^127\.' | jq -R . | jq -s .)
+    curl -sf --max-time 5 -X POST \
+        "${SERVER_URL}/api/peers/${PEER_ID}/heartbeat" \
+        -H "Content-Type: application/json" \
+        -d "{\"endpoint\":\"${NEW_ENDPOINT}\",\"local_ips\":${LOCAL_IPS}}" > /dev/null 2>&1 || true
+}
+
+# ─── Loop principal ───
 if command -v websocat &>/dev/null; then
     WS_URL=$(echo "${SERVER_URL}" | sed 's|http://|ws://|' | sed 's|https://|wss://|')
     logger -t kalman-net-sync "conectando WebSocket ${WS_URL}/ws?peer_id=${PEER_ID}"
@@ -183,24 +339,43 @@ if command -v websocat &>/dev/null; then
     while true; do
         websocat --no-close -t "${WS_URL}/ws?peer_id=${PEER_ID}" 2>/dev/null | while IFS= read -r line; do
             [ -z "${line}" ] && continue
-            apply_network_map "${line}"
+            MSG_TYPE=$(echo "${line}" | jq -r '.type // empty' 2>/dev/null)
+            PAYLOAD=$(echo "${line}"  | jq -c '.payload // empty' 2>/dev/null)
+            case "${MSG_TYPE}" in
+                network_map)
+                    apply_network_map "${PAYLOAD}"
+                    ;;
+                punch)
+                    do_punch "${PAYLOAD}"
+                    ;;
+                relay)
+                    logger -t kalman-net-sync "relay pkt recibido (ignorado en robot)"
+                    ;;
+                "")
+                    # Formato antiguo — red map directo
+                    apply_network_map "${line}"
+                    ;;
+            esac
         done
         logger -t kalman-net-sync "WebSocket desconectado, reconectando en 5s..."
         sleep 5
     done
 else
-    # Fallback: polling cada 30s vía HTTP
-    logger -t kalman-net-sync "websocat no disponible, usando polling HTTP cada 30s"
+    # Fallback: polling HTTP cada 30s
+    logger -t kalman-net-sync "websocat no disponible, usando polling HTTP"
+    STUN_TICK=0
     while true; do
         MAP=$(curl -sf --max-time 10 \
             "${SERVER_URL}/api/peers/${PEER_ID}/network-map" 2>/dev/null || echo "")
         [ -n "${MAP}" ] && apply_network_map "${MAP}"
 
-        # Heartbeat
         curl -sf --max-time 5 -X POST \
             "${SERVER_URL}/api/peers/${PEER_ID}/heartbeat" \
             -H "Content-Type: application/json" \
             -d "{}" > /dev/null 2>&1 || true
+
+        STUN_TICK=$((STUN_TICK + 1))
+        [ $((STUN_TICK % 10)) -eq 0 ] && update_stun_endpoint
 
         sleep 30
     done
@@ -231,7 +406,7 @@ systemctl enable kalman-net-sync --quiet
 systemctl restart kalman-net-sync
 log_ok "Daemon kalman-net-sync activo."
 
-# ─── 7. Configurar CycloneDDS sobre wg0 ───
+# ─── 9. Configurar CycloneDDS sobre wg0 ───
 log_info "Configurando CycloneDDS sobre WireGuard..."
 
 cat > "${KALMAN_DIR}/cyclonedds.xml" << 'EOF'
@@ -268,7 +443,6 @@ cat > "${KALMAN_DIR}/cyclonedds.xml" << 'EOF'
 </CycloneDDS>
 EOF
 
-# Variables ROS2 en .bashrc (del usuario que ejecuta el script)
 REAL_USER="${SUDO_USER:-$(whoami)}"
 REAL_HOME=$(eval echo "~${REAL_USER}")
 BASHRC="${REAL_HOME}/.bashrc"
@@ -294,6 +468,7 @@ echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━
 echo -e "  Hostname:   ${ROBOT_HOSTNAME}"
 echo -e "  Peer ID:    ${PEER_ID}"
 echo -e "  IP overlay: ${OVERLAY_IP}"
+echo -e "  Endpoint:   ${PUBLIC_ENDPOINT}"
 echo -e "  Puerto WG:  ${WG_PORT}/udp  ← abrir en firewall/security group"
 echo
 echo -e "  Verifica la interfaz:  ${YELLOW}wg show${NC}"
