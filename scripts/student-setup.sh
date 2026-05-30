@@ -91,7 +91,7 @@ log_ok "IPs locales: ${LOCAL_IPS}"
 # ─── 5. STUN para obtener IP pública (antes de levantar WireGuard) ───
 log_info "Detectando endpoint público via STUN..."
 PRIVATE_KEY=$(cat "${KALMAN_DIR}/privatekey")
-PUBLIC_ENDPOINT=$(python3 - <<'PYEOF' 2>/dev/null || echo "")
+cat > /tmp/kalman_stun.py << 'PYEOF'
 import socket, struct, os
 STUN_SERVER = ("stun.l.google.com", 19302)
 pkt = struct.pack(">HHI12s", 0x0001, 0, 0x2112A442, os.urandom(12))
@@ -113,7 +113,7 @@ try:
 except:
     pass
 PYEOF
-)
+PUBLIC_ENDPOINT=$(python3 /tmp/kalman_stun.py 2>/dev/null || echo "")
 
 if [ -z "${PUBLIC_ENDPOINT}" ]; then
     PUBLIC_ENDPOINT=$(curl -s --max-time 5 https://api.ipify.org || echo "")

@@ -77,7 +77,7 @@ log_ok "IPs locales: ${LOCAL_IPS}"
 log_info "Detectando endpoint público via STUN..."
 # STUN desde puerto efímero — lo que importa es la IP pública, no el puerto exacto
 # El puerto real de WG (51820) lo reportamos fijo después
-PUBLIC_ENDPOINT=$(python3 - <<'PYEOF' 2>/dev/null || echo "")
+cat > /tmp/kalman_stun.py << 'PYEOF'
 import socket, struct, os
 STUN_SERVER = ("stun.l.google.com", 19302)
 pkt = struct.pack(">HHI12s", 0x0001, 0, 0x2112A442, os.urandom(12))
@@ -99,7 +99,7 @@ try:
 except:
     pass
 PYEOF
-)
+PUBLIC_ENDPOINT=$(python3 /tmp/kalman_stun.py 2>/dev/null || echo "")
 
 if [ -z "${PUBLIC_ENDPOINT}" ]; then
     PUBLIC_ENDPOINT=$(curl -s --max-time 5 https://api.ipify.org || echo "")
