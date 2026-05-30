@@ -171,7 +171,11 @@ log_ok "Interfaz ${WG_IFACE} activa. IP: ${OVERLAY_IP}"
 # ─── 9. Instalar kalman-net-sync ───
 log_info "Instalando daemon de sincronización..."
 
-cat > /usr/local/bin/kalman-net-sync.sh << 'SYNCEOF'
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cp "${SCRIPT_DIR}/kalman-net-sync-student.sh" /usr/local/bin/kalman-net-sync.sh
+chmod +x /usr/local/bin/kalman-net-sync.sh
+
+: << 'SYNCEOF'
 #!/bin/bash
 # kalman-net-sync: mantiene WireGuard sincronizado y ejecuta hole punching P2P
 
@@ -328,8 +332,6 @@ else
     done
 fi
 SYNCEOF
-
-chmod +x /usr/local/bin/kalman-net-sync.sh
 
 cat > /etc/systemd/system/kalman-net-sync.service << EOF
 [Unit]
