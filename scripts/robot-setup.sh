@@ -73,73 +73,43 @@ LOCAL_IPS=$(ip -4 addr show scope global | grep -oP '(?<=inet )\d+\.\d+\.\d+\.\d
 LOCAL_IPS_JSON=$(echo "${LOCAL_IPS}" | tr ',' '\n' | grep -v '^$' | jq -R . | jq -s .)
 log_ok "IPs locales: ${LOCAL_IPS}"
 
-# ─── 4. Levantar interfaz WireGuard (necesaria para STUN desde ese puerto) ───
-log_info "Configurando interfaz WireGuard (${WG_IFACE})..."
-mkdir -p /etc/wireguard
-
-cat > /etc/wireguard/wg0.conf << WGEOF
-[Interface]
-PrivateKey = ${PRIVATE_KEY}
-Address = 10.99.0.1/24
-ListenPort = ${WG_PORT}
-WGEOF
-chmod 600 /etc/wireguard/wg0.conf
-
-wg-quick down "${WG_IFACE}" 2>/dev/null || true
-wg-quick up "${WG_IFACE}"
-log_ok "Interfaz ${WG_IFACE} activa (provisional)."
-
-# ─── 5. STUN desde el puerto WireGuard para obtener endpoint público real ───
-log_info "Detectando endpoint público via STUN desde puerto ${WG_PORT}..."
-# Usamos python3 para hacer STUN binding desde el puerto WG
-PUBLIC_ENDPOINT=$(python3 - <<'PYEOF' 2>/dev/null || echo ""
+# ─── 4. STUN para obtener endpoint público (antes de levantar WireGuard) ───
+log_info "Detectando endpoint público via STUN..."
+# STUN desde puerto efímero — lo que importa es la IP pública, no el puerto exacto
+# El puerto real de WG (51820) lo reportamos fijo después
+PUBLIC_ENDPOINT=$(python3 - <<'PYEOF' 2>/dev/null || echo "")
 import socket, struct, os
-
-# STUN binding request (RFC 5389)
 STUN_SERVER = ("stun.l.google.com", 19302)
-MSG_TYPE = 0x0001
-MSG_LEN  = 0
-MAGIC    = 0x2112A442
-TX_ID    = os.urandom(12)
-
-pkt = struct.pack(">HHI12s", MSG_TYPE, MSG_LEN, MAGIC, TX_ID)
-
+pkt = struct.pack(">HHI12s", 0x0001, 0, 0x2112A442, os.urandom(12))
 try:
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-    s.bind(("0.0.0.0", 51820))
     s.settimeout(5)
     s.sendto(pkt, STUN_SERVER)
     data, _ = s.recvfrom(512)
     s.close()
-
-    # Parsear respuesta — buscar atributo XOR-MAPPED-ADDRESS (0x0020)
     offset = 20
     while offset < len(data) - 4:
-        attr_type  = struct.unpack(">H", data[offset:offset+2])[0]
-        attr_len   = struct.unpack(">H", data[offset+2:offset+4])[0]
-        if attr_type == 0x0020:  # XOR-MAPPED-ADDRESS
-            family = data[offset+5]
-            if family == 0x01:  # IPv4
-                port = struct.unpack(">H", data[offset+6:offset+8])[0] ^ 0x2112
-                ip   = bytes(b ^ v for b, v in zip(data[offset+8:offset+12], struct.pack(">I", 0x2112A442)))
-                print(f"{ip[0]}.{ip[1]}.{ip[2]}.{ip[3]}:{port}")
-                break
-        offset += 4 + attr_len + (4 - attr_len % 4) % 4
-except Exception as e:
+        t = struct.unpack(">H", data[offset:offset+2])[0]
+        l = struct.unpack(">H", data[offset+2:offset+4])[0]
+        if t == 0x0020 and data[offset+5] == 1:
+            ip = bytes(b ^ v for b, v in zip(data[offset+8:offset+12], struct.pack(">I", 0x2112A442)))
+            print(f"{ip[0]}.{ip[1]}.{ip[2]}.{ip[3]}")
+            break
+        offset += 4 + l + (4 - l % 4) % 4
+except:
     pass
 PYEOF
 )
 
 if [ -z "${PUBLIC_ENDPOINT}" ]; then
-    # Fallback: ip pública + puerto fijo
-    PUBLIC_IP=$(curl -s --max-time 5 https://api.ipify.org || echo "")
-    PUBLIC_ENDPOINT="${PUBLIC_IP}:${WG_PORT}"
-    log_warn "STUN falló, usando fallback: ${PUBLIC_ENDPOINT}"
-else
-    log_ok "Endpoint STUN: ${PUBLIC_ENDPOINT}"
+    PUBLIC_ENDPOINT=$(curl -s --max-time 5 https://api.ipify.org || echo "")
+    log_warn "STUN falló, usando fallback IP: ${PUBLIC_ENDPOINT}"
 fi
+PUBLIC_ENDPOINT="${PUBLIC_ENDPOINT}:${WG_PORT}"
+log_ok "Endpoint: ${PUBLIC_ENDPOINT}"
+
+# ─── 5b. Bajar interfaz anterior si existe ───
+wg-quick down "${WG_IFACE}" 2>/dev/null || true
 
 # ─── 6. Registrar en el servidor de control ───
 log_info "Registrando en el servidor de control..."
@@ -164,7 +134,10 @@ echo "${OVERLAY_IP}"        > "${KALMAN_DIR}/overlay_ip"
 echo "${KALMAN_NET_SERVER}" > "${KALMAN_DIR}/server_url"
 log_ok "Registrado. Peer ID: ${PEER_ID} | IP overlay: ${OVERLAY_IP}"
 
-# ─── 7. Actualizar configuración WireGuard con IP overlay correcta ───
+# ─── 7. Levantar interfaz WireGuard con IP overlay asignada ───
+log_info "Configurando interfaz WireGuard (${WG_IFACE})..."
+mkdir -p /etc/wireguard
+
 cat > /etc/wireguard/wg0.conf << WGEOF
 [Interface]
 PrivateKey = ${PRIVATE_KEY}
@@ -173,7 +146,6 @@ ListenPort = ${WG_PORT}
 WGEOF
 chmod 600 /etc/wireguard/wg0.conf
 
-wg-quick down "${WG_IFACE}" 2>/dev/null || true
 wg-quick up "${WG_IFACE}"
 log_ok "Interfaz ${WG_IFACE} activa. IP: ${OVERLAY_IP}"
 
